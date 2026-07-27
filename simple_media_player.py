@@ -141,7 +141,7 @@ class SimpleVLCPlayer:
             vlc_py_ver = "未安装"
 
         info = (
-            f"小航航专用媒体播放器  {APP_VERSION}\n"
+            f"简单媒体播放器  {APP_VERSION}\n"
             f"{'─' * 36}\n"
             f"Python 版本：{py_ver}  ({python_bits})\n"
             f"python-vlc：{vlc_py_ver}\n"
