@@ -1,23 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-VLC 视频播放器（v1.1）
+VLC 视频播放器(v1.2)
 功能：
 - 独立暂停按钮，播放键负责播放/恢复
 - 点击视频画面 = 暂停/播放（带前台窗口判断）
-- 时间显示、键盘快捷键、全屏、静音、倍速
+- 时间显示、键盘快捷键（含空格暂停/播放）、全屏、静音、倍速
 - 全屏时自动隐藏控制栏，鼠标移到屏幕底部才显示
 - 进度条用 set_time 跳转，更精确可靠
-- 播放结束自动重置状态 / 自动下一首
+- 播放结束自动重置状态 / 自动下一首（支持顺序/列表循环/单曲循环）
+- 退出时记住播放进度、音量、倍速、循环模式、最近播放，下次启动自动续播
+- 最近播放记录（最多 10 条，文件菜单下）
+- 窗口置顶、画面比例切换(A 键)、AB 复读(B 键)
+- 播完列表自动关机 / 30 分钟定时关机（工具菜单）
 - 支持 [ / ] 快捷调整倍速
 - 菜单栏：文件 → 打开单个 / 打开多个 / 打开文件夹 / 退出
 - 播放列表：默认隐藏，双击播放，上一首/下一首，右键删除/清空
 - 播放列表为空时按钮自动灰掉
 - 音量数字实时显示
+- 播放音频文件时视频区显示封面画面 + 装饰性柱状动画（可用 audio_cover.png 自定义图片）
 """
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import sys
 import os
+import json
+import math
+import random
 
 try:
     import vlc
@@ -33,6 +41,13 @@ except Exception:
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm",
               ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma"}
+
+# 音频格式：播放这些文件时视频区显示静态封面画面
+AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma"}
+
+# 音频封面上的装饰性柱状动画（纯装饰，不反映真实音频频谱）
+COVER_BAR_COUNT = 32        # 柱子数量
+COVER_ANIM_INTERVAL = 50    # 动画刷新间隔（毫秒）
 
 VIDEO_FILETYPES = [
     ("所有文件", "*.*"),
@@ -59,7 +74,22 @@ VIDEO_PADX = 8
 VIDEO_PADY_TOP = 8
 VIDEO_PADY_BOTTOM = 4
 
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.2"
+
+# 循环模式：顺序播放 / 列表循环 / 单曲循环
+LOOP_MODES = ["顺序播放", "列表循环", "单曲循环"]
+
+# 画面比例循环选项（A 键切换）
+ASPECT_RATIOS = [("原始", None), ("16:9", "16:9"), ("4:3", "4:3"), ("1:1", "1:1")]
+
+# 最近播放记录的最大条数
+RECENT_MAX = 10
+
+# 定时关机的分钟数
+SHUTDOWN_TIMER_MINUTES = 30
+
+# 配置保存路径（记住上次播放进度、音量、倍速、循环模式）
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "player_config.json")
 
 
 def fmt_time(ms: int) -> str:
@@ -80,7 +110,7 @@ def get_filename(path: str) -> str:
 class SimpleVLCPlayer:
     def __init__(self, root):
         self.root = root
-        self.root.title("Simple Media Player")
+        self.root.title("简单媒体播放器")
         self.root.geometry("1100x680")
         self.root.minsize(760, 480)
 
@@ -108,6 +138,15 @@ class SimpleVLCPlayer:
         self._hide_job = None
         self._progress_interval = 200  # 动态刷新间隔
         self._playlist_visible = False  # 默认隐藏
+        self._loop_mode = 0             # 循环模式索引（LOOP_MODES）
+        self.recent_files = []          # 最近播放记录（最新在前）
+        self._topmost_var = tk.BooleanVar(value=False)        # 窗口置顶
+        self._shutdown_end_var = tk.BooleanVar(value=False)   # 播完列表后关机
+        self._shutdown_timer_var = tk.BooleanVar(value=False) # 30 分钟后关机
+        self._shutdown_job = None       # 定时关机的 after() 句柄
+        self._aspect_idx = 0            # 画面比例索引（ASPECT_RATIOS）
+        self._ab_a = None               # AB 复读 A 点（毫秒）
+        self._ab_b = None               # AB 复读 B 点（毫秒）
 
         self.create_menu()
         self.create_widgets()
@@ -117,6 +156,7 @@ class SimpleVLCPlayer:
         if _user32 is not None:
             self._poll_click()
         self._update_playlist_buttons()
+        self._load_config()
 
     # ---------- 菜单栏 ----------
     def create_menu(self):
@@ -129,13 +169,28 @@ class SimpleVLCPlayer:
         file_menu.add_command(label="打开单个文件...", command=self.load_video, accelerator="Ctrl+O")
         file_menu.add_command(label="打开多个文件...", command=self.load_multiple_videos, accelerator="Ctrl+Shift+O")
         file_menu.add_command(label="打开文件夹...", command=self.load_folder, accelerator="Ctrl+F")
+        # 最近播放子菜单
+        self.recent_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="最近播放", menu=self.recent_menu)
+        self._refresh_recent_menu()
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_closing, accelerator="Alt+F4")
 
-        # 帮助菜单
+        # 视图菜单
         view_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="视图", menu=view_menu)
         view_menu.add_command(label="显示/隐藏播放列表", command=self.toggle_playlist, accelerator="Ctrl+L")
+        view_menu.add_checkbutton(label="窗口置顶", variable=self._topmost_var,
+                                  command=self._toggle_topmost)
+        view_menu.add_command(label="切换画面比例", command=self.toggle_aspect, accelerator="A")
+
+        # 工具菜单
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="工具", menu=tools_menu)
+        tools_menu.add_checkbutton(label="播完列表后自动关机", variable=self._shutdown_end_var)
+        tools_menu.add_checkbutton(label=f"{SHUTDOWN_TIMER_MINUTES} 分钟后自动关机",
+                                   variable=self._shutdown_timer_var,
+                                   command=self._toggle_shutdown_timer)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="帮助", menu=help_menu)
@@ -178,11 +233,14 @@ class SimpleVLCPlayer:
             f"VLC 库版本：{vlc_lib_ver}\n"
             f"{'─' * 36}\n"
             f"快捷键：\n"
+            f"  空格       暂停 / 播放\n"
             f"  F          全屏 / 退出全屏\n"
             f"  ← / →      快退 / 快进 5 秒\n"
             f"  ↑ / ↓      音量 +/-\n"
             f"  [ / ]      倍速 -0.25x / +0.25x\n"
             f"  M          静音切换\n"
+            f"  A          切换画面比例\n"
+            f"  B          AB 复读（设A点/设B点/取消）\n"
             f"  PgUp/PgDn  上一首 / 下一首\n"
             f"  Esc        退出全屏\n"
             f"  双击画面   全屏切换\n"
@@ -259,6 +317,43 @@ class SimpleVLCPlayer:
         )
         self.video_frame.bind("<Double-Button-1>", lambda e: self.toggle_fullscreen())
 
+        # 音频封面：播放音频文件时盖住视频区的静态画面（默认不显示）
+        self.audio_cover = tk.Frame(self.video_frame, bg="#1b1b2f")
+        cover_inner = tk.Frame(self.audio_cover, bg="#1b1b2f")
+        cover_inner.pack(expand=True)
+        # 若脚本目录下存在 audio_cover.png 则优先显示该图片，否则显示音符图标
+        self._cover_photo = None
+        cover_png = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_cover.png")
+        if os.path.exists(cover_png):
+            try:
+                self._cover_photo = tk.PhotoImage(file=cover_png)
+            except Exception:
+                self._cover_photo = None
+        if self._cover_photo is not None:
+            tk.Label(cover_inner, image=self._cover_photo, bg="#1b1b2f").pack()
+        else:
+            tk.Label(cover_inner, text="🎵", bg="#1b1b2f", fg="#e0e0e0",
+                     font=("Segoe UI Emoji", 72)).pack()
+        self.cover_name_label = tk.Label(cover_inner, text="", bg="#1b1b2f", fg="#cccccc",
+                                         font=("Microsoft YaHei", 12), wraplength=600)
+        self.cover_name_label.pack(pady=(16, 0))
+
+        # 装饰性柱状动画画布（纯装饰，不反映真实音频频谱）
+        self.cover_canvas = tk.Canvas(self.audio_cover, height=120, bg="#1b1b2f",
+                                      highlightthickness=0, bd=0)
+        self.cover_canvas.pack(fill=tk.X, side=tk.BOTTOM, padx=40, pady=(0, 30))
+        # 柱子颜色：从 #3a7bd5 到 #4fc3f7 的渐变
+        c1, c2 = (58, 123, 213), (79, 195, 247)
+        self._cover_bar_colors = [
+            "#{:02x}{:02x}{:02x}".format(
+                *[int(a + (b - a) * i / (COVER_BAR_COUNT - 1)) for a, b in zip(c1, c2)]
+            ) for i in range(COVER_BAR_COUNT)
+        ]
+        self._cover_bars = [0.08] * COVER_BAR_COUNT    # 当前高度比例（0~1）
+        self._cover_bar_targets = [0.08] * COVER_BAR_COUNT
+        self._cover_phase = 0                          # 动画相位
+        self._cover_anim_job = None                    # after() 任务句柄
+
         # 底部控制区
         self.bottom_frame = tk.Frame(self.right_frame)
         self.bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
@@ -303,6 +398,11 @@ class SimpleVLCPlayer:
         self.full_btn = tk.Button(control_frame, text="⛶ 全屏", command=self.toggle_fullscreen, width=6)
         self.full_btn.pack(side=tk.LEFT, padx=2)
 
+        # 循环模式切换
+        self.loop_btn = tk.Button(control_frame, text=f"🔁 {LOOP_MODES[self._loop_mode]}",
+                                  command=self.toggle_loop_mode, width=9)
+        self.loop_btn.pack(side=tk.LEFT, padx=(8, 2))
+
         # 倍速
         tk.Label(control_frame, text="倍速:").pack(side=tk.LEFT, padx=(12, 2))
         self.speed_var = tk.StringVar(value="1.0x")
@@ -320,13 +420,20 @@ class SimpleVLCPlayer:
         self.volume_label = tk.Label(control_frame, text="50", width=3, font=("Microsoft YaHei", 9, "bold"))
         self.volume_label.pack(side=tk.LEFT, padx=(0, 4))
 
+        # 所有按钮不抢占键盘焦点，保证空格等快捷键点过按钮后依然有效
+        for btn in (self.load_btn, self.play_btn, self.pause_btn, self.stop_btn,
+                    self.prev_btn, self.next_btn, self.mute_btn, self.full_btn,
+                    self.loop_btn, self.pl_prev_btn, self.pl_next_btn, self.pl_clear_btn):
+            btn.config(takefocus=0)
+
         # 状态栏
         self.status_label = tk.Label(self.bottom_frame,
-                                     text="未加载媒体  |  点击画面=暂停/播放  ←→=快进快退  F=全屏  [ ]=倍速  PgUp/PgDn=切歌",
+                                     text="未加载媒体  |  空格/点击画面=暂停播放  ←→=快进快退  F=全屏  [ ]=倍速  PgUp/PgDn=切歌",
                                      anchor=tk.W, fg="gray")
         self.status_label.pack(fill=tk.X, padx=8, pady=(0, 4))
 
     def bind_keys(self):
+        self.root.bind_all("<space>", self._on_space)
         self.root.bind("<Left>", lambda e: self.seek_by(-5000))
         self.root.bind("<Right>", lambda e: self.seek_by(5000))
         self.root.bind("<Up>", lambda e: self.nudge_volume(5))
@@ -335,6 +442,10 @@ class SimpleVLCPlayer:
         self.root.bind("F", lambda e: self.toggle_fullscreen())
         self.root.bind("m", lambda e: self.toggle_mute())
         self.root.bind("M", lambda e: self.toggle_mute())
+        self.root.bind("a", lambda e: self.toggle_aspect())
+        self.root.bind("A", lambda e: self.toggle_aspect())
+        self.root.bind("b", lambda e: self.toggle_ab())
+        self.root.bind("B", lambda e: self.toggle_ab())
         self.root.bind("<Escape>", lambda e: self.exit_fullscreen())
         self.root.bind("<bracketleft>", lambda e: self.nudge_speed(-0.25))
         self.root.bind("<bracketright>", lambda e: self.nudge_speed(0.25))
@@ -377,6 +488,57 @@ class SimpleVLCPlayer:
         if added > 0 and self.current_index == -1:
             self.play_at(0)
 
+    def _update_audio_cover(self, path: str = None):
+        """播放音频文件时显示封面画面（含装饰性柱状动画），其余情况隐藏"""
+        if path and os.path.splitext(path)[1].lower() in AUDIO_EXTS:
+            self.cover_name_label.config(text=get_filename(path))
+            self.audio_cover.place(relx=0, rely=0, relwidth=1, relheight=1)
+            if self._cover_anim_job is None:
+                self._cover_anim_job = self.root.after(0, self._animate_cover)
+        else:
+            self.audio_cover.place_forget()
+            if self._cover_anim_job is not None:
+                self.root.after_cancel(self._cover_anim_job)
+                self._cover_anim_job = None
+
+    def _animate_cover(self):
+        """柱状动画 tick：播放中让目标高度按叠加正弦 + 随机扰动跳动，
+        暂停时回落到低矮静止柱；当前高度始终向目标平滑过渡。"""
+        playing = False
+        try:
+            playing = self.player.get_state() == vlc.State.Playing
+        except Exception:
+            pass
+        if playing:
+            self._cover_phase += 1
+            t = self._cover_phase
+            for i in range(COVER_BAR_COUNT):
+                v = (0.45 + 0.30 * math.sin(t * 0.35 + i * 0.6)
+                          + 0.25 * math.sin(t * 0.13 + i * 1.7))
+                self._cover_bar_targets[i] = max(0.05, min(1.0, v + random.uniform(-0.08, 0.08)))
+        else:
+            self._cover_bar_targets = [0.08] * COVER_BAR_COUNT
+        for i in range(COVER_BAR_COUNT):
+            cur = self._cover_bars[i]
+            self._cover_bars[i] = cur + (self._cover_bar_targets[i] - cur) * 0.3
+        self._draw_cover_bars()
+        self._cover_anim_job = self.root.after(COVER_ANIM_INTERVAL, self._animate_cover)
+
+    def _draw_cover_bars(self):
+        """按当前高度比例重绘柱子"""
+        c = self.cover_canvas
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 10 or h < 10:
+            return
+        c.delete("bar")
+        gap = 3
+        bw = (w - gap * (COVER_BAR_COUNT - 1)) / COVER_BAR_COUNT
+        for i, ratio in enumerate(self._cover_bars):
+            bh = max(2, ratio * (h - 4))
+            x0 = i * (bw + gap)
+            c.create_rectangle(x0, h - bh, x0 + bw, h,
+                               fill=self._cover_bar_colors[i], width=0, tags="bar")
+
     def play_at(self, index: int):
         """播放指定索引的文件"""
         if not (0 <= index < len(self.playlist)):
@@ -398,6 +560,10 @@ class SimpleVLCPlayer:
             self.status_label.config(text=f"[{index + 1}/{len(self.playlist)}] {get_filename(path)}")
             self.player.play()
             self.player.set_rate(float(self.speed_var.get().rstrip("x")))
+            self._update_audio_cover(path)
+            self._add_recent(path)
+            # 切换文件时重置 AB 复读点
+            self._ab_a = self._ab_b = None
             # 绑定播放结束事件
             self._attach_end_event()
         except Exception as e:
@@ -471,12 +637,110 @@ class SimpleVLCPlayer:
         """更新列表数量显示"""
         self.count_label.config(text=f"(共 {len(self.playlist)} 首)")
 
+    # ---------- 最近播放 ----------
+    def _add_recent(self, path: str):
+        """把文件记入最近播放（去重、最新在前、最多 RECENT_MAX 条）"""
+        if path in self.recent_files:
+            self.recent_files.remove(path)
+        self.recent_files.insert(0, path)
+        del self.recent_files[RECENT_MAX:]
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self):
+        """重建最近播放子菜单"""
+        self.recent_menu.delete(0, tk.END)
+        if not self.recent_files:
+            self.recent_menu.add_command(label="（空）", state=tk.DISABLED)
+            return
+        for p in self.recent_files:
+            self.recent_menu.add_command(label=get_filename(p),
+                                         command=lambda x=p: self._open_recent(x))
+        self.recent_menu.add_separator()
+        self.recent_menu.add_command(label="清空记录", command=self._clear_recent)
+
+    def _open_recent(self, path: str):
+        """打开最近播放记录中的文件"""
+        if not os.path.exists(path):
+            messagebox.showinfo("提示", f"文件已不存在：\n{path}")
+            self.recent_files.remove(path)
+            self._refresh_recent_menu()
+            return
+        if path in self.playlist:
+            self.play_at(self.playlist.index(path))
+        else:
+            self.add_to_playlist([path])
+            self.play_at(len(self.playlist) - 1)
+
+    def _clear_recent(self):
+        self.recent_files.clear()
+        self._refresh_recent_menu()
+
+    # ---------- 视图：置顶 / 画面比例 ----------
+    def _toggle_topmost(self):
+        self.root.attributes("-topmost", self._topmost_var.get())
+
+    def toggle_aspect(self):
+        """循环切换画面比例（A 键）"""
+        self._aspect_idx = (self._aspect_idx + 1) % len(ASPECT_RATIOS)
+        name, value = ASPECT_RATIOS[self._aspect_idx]
+        try:
+            self.player.video_set_aspect_ratio(value)
+        except Exception:
+            pass
+        self._update_status(f"画面比例：{name}")
+
+    # ---------- AB 复读 ----------
+    def toggle_ab(self):
+        """B 键三次循环：设 A 点 → 设 B 点（开始复读）→ 取消"""
+        if self.current_index == -1:
+            return
+        if self._ab_a is None:
+            self._ab_a = self.player.get_time()
+            self._update_status("复读：已设 A 点，再按 B 设终点")
+        elif self._ab_b is None:
+            t = self.player.get_time()
+            if t <= self._ab_a:
+                return  # B 点必须晚于 A 点
+            self._ab_b = t
+            self._update_status(f"复读中：{fmt_time(self._ab_a)} → {fmt_time(self._ab_b)}（再按 B 取消）")
+        else:
+            self._ab_a = self._ab_b = None
+            self._update_status("复读：已取消")
+
+    # ---------- 定时关机 ----------
+    def _toggle_shutdown_timer(self):
+        """30 分钟定时关机开关"""
+        if self._shutdown_timer_var.get():
+            self._shutdown_job = self.root.after(
+                SHUTDOWN_TIMER_MINUTES * 60 * 1000, self._do_shutdown)
+            self._update_status(f"已设置 {SHUTDOWN_TIMER_MINUTES} 分钟后自动关机")
+        else:
+            if self._shutdown_job is not None:
+                self.root.after_cancel(self._shutdown_job)
+                self._shutdown_job = None
+            self._update_status("已取消定时关机")
+
+    def _do_shutdown(self):
+        """执行关机：60 秒倒计时，期间运行 shutdown /a 可取消"""
+        self._shutdown_job = None
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        os.system('shutdown /s /t 60')
+
     # ---------- 文件加载 ----------
     def load_video(self):
-        """打开单个文件"""
+        """打开单个文件并立即播放"""
         file_path = filedialog.askopenfilename(title="选择媒体文件", filetypes=VIDEO_FILETYPES)
-        if file_path:
+        if not file_path:
+            return
+        if file_path in self.playlist:
+            # 已在列表中则直接播放已有项
+            self.play_at(self.playlist.index(file_path))
+        else:
             self.add_to_playlist([file_path])
+            self.play_at(len(self.playlist) - 1)
 
     def load_multiple_videos(self):
         """打开多个文件"""
@@ -515,18 +779,41 @@ class SimpleVLCPlayer:
         self.root.after(0, self._auto_next)
 
     def _auto_next(self):
-        """自动播放下一首（循环）"""
-        if self.playlist and self.current_index >= 0:
-            next_idx = self.current_index + 1
-            if next_idx < len(self.playlist):
-                self.play_at(next_idx)
-            else:
-                self.current_index = -1
-                self.stop_video()
-                self.playlist_box.selection_clear(0, tk.END)
-                self.status_label.config(text="列表播放完毕")
+        """播放结束后的行为，按循环模式处理"""
+        if not (self.playlist and self.current_index >= 0):
+            return
+        if self._loop_mode == 2:  # 单曲循环
+            self.play_at(self.current_index)
+            return
+        next_idx = self.current_index + 1
+        if next_idx < len(self.playlist):
+            self.play_at(next_idx)
+        elif self._loop_mode == 1:  # 列表循环：回到第一首
+            self.play_at(0)
+        else:  # 顺序播放：播完即止
+            self.current_index = -1
+            self.stop_video()
+            self.playlist_box.selection_clear(0, tk.END)
+            self.status_label.config(text="列表播放完毕")
+            if self._shutdown_end_var.get():
+                self._do_shutdown()
+
+    def toggle_loop_mode(self):
+        """循环切换：顺序播放 → 列表循环 → 单曲循环"""
+        self._loop_mode = (self._loop_mode + 1) % len(LOOP_MODES)
+        self.loop_btn.config(text=f"🔁 {LOOP_MODES[self._loop_mode]}")
 
     # ---------- 播放控制 ----------
+    def _on_space(self, event):
+        """空格键：播放中则暂停，否则播放/恢复。
+        返回 "break" 阻止事件继续传播（按钮已设 takefocus=0，
+        正常不会抢焦点，这里只是兜底）。"""
+        if self.current_index >= 0:
+            if self.player.get_state() == vlc.State.Playing:
+                self.pause_video()
+            else:
+                self.play_video()
+        return "break"
     def play_video(self):
         """播放按钮：负责播放和暂停后的恢复"""
         if not self.playlist:
@@ -549,6 +836,7 @@ class SimpleVLCPlayer:
         self.player.stop()
         self.progress.set(0)
         self.time_label.config(text="00:00 / 00:00")
+        self._update_audio_cover()
         self._update_status("已停止")
 
     def seek_by(self, ms: int):
@@ -717,7 +1005,7 @@ class SimpleVLCPlayer:
     # ---------- 状态栏 ----------
     def _update_status(self, state_text: str):
         """更新状态栏，保留原始提示信息"""
-        base = "点击画面=暂停/播放  ←→=快进快退  F=全屏  [ ]=倍速  PgUp/PgDn=切歌"
+        base = "空格/点击画面=暂停播放  ←→=快进快退  F=全屏  [ ]=倍速  PgUp/PgDn=切歌"
         if self.current_index >= 0:
             name = get_filename(self.playlist[self.current_index])
             self.status_label.config(text=f"[{self.current_index + 1}/{len(self.playlist)}] {state_text}  |  {base}")
@@ -733,6 +1021,9 @@ class SimpleVLCPlayer:
                 if length > 0:
                     self.progress.set((current / length) * 100)
                     self.time_label.config(text=f"{fmt_time(current)} / {fmt_time(length)}")
+                # AB 复读：越过 B 点跳回 A 点
+                if self._ab_a is not None and self._ab_b is not None and current > self._ab_b:
+                    self.player.set_time(self._ab_a)
                 # 根据播放状态动态调整刷新频率
                 state = self.player.get_state()
                 self._progress_interval = 200 if state == vlc.State.Playing else 1000
@@ -740,8 +1031,90 @@ class SimpleVLCPlayer:
                 pass
         self.root.after(self._progress_interval, self.update_progress)
 
+    # ---------- 配置保存 / 恢复 ----------
+    def _save_config(self):
+        """退出时保存：当前文件、播放进度、音量、倍速、循环模式"""
+        data = {
+            "file": None,
+            "position_ms": 0,
+            "volume": int(self.volume_scale.get()),
+            "speed": self.speed_var.get(),
+            "loop_mode": self._loop_mode,
+            "recent": self.recent_files,
+            "topmost": self._topmost_var.get(),
+        }
+        if self.playlist and self.current_index >= 0:
+            data["file"] = self.playlist[self.current_index]
+            try:
+                data["position_ms"] = max(0, self.player.get_time())
+            except Exception:
+                pass
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _load_config(self):
+        """启动时恢复上次状态；上次播放的文件还在则自动续播"""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return
+        # 音量（set 会触发 set_volume 同步到播放器）
+        try:
+            self.volume_scale.set(max(0, min(100, int(cfg.get("volume", 50)))))
+        except Exception:
+            pass
+        # 倍速
+        speed = str(cfg.get("speed", "1.0x"))
+        if speed in self.speed_box["values"]:
+            self.speed_var.set(speed)
+        # 循环模式
+        loop_mode = cfg.get("loop_mode", 0)
+        if isinstance(loop_mode, int) and 0 <= loop_mode < len(LOOP_MODES):
+            self._loop_mode = loop_mode
+            self.loop_btn.config(text=f"🔁 {LOOP_MODES[self._loop_mode]}")
+        # 最近播放
+        recent = cfg.get("recent", [])
+        if isinstance(recent, list):
+            self.recent_files = [p for p in recent if isinstance(p, str)][:RECENT_MAX]
+            self._refresh_recent_menu()
+        # 窗口置顶
+        if cfg.get("topmost"):
+            self._topmost_var.set(True)
+            self._toggle_topmost()
+        # 续播上次的文件
+        path = cfg.get("file")
+        if path and os.path.exists(path):
+            self.add_to_playlist([path])  # 空闲状态会自动播放
+            pos = cfg.get("position_ms", 0)
+            if isinstance(pos, (int, float)) and pos > 0:
+                self.root.after(500, lambda: self._resume_position(int(pos)))
+
+    def _resume_position(self, ms: int, attempts: int = 20):
+        """等媒体解析完成后跳转到指定进度（未就绪则每 0.5 秒重试）"""
+        if self.current_index == -1:
+            return
+        try:
+            if self.player.get_length() > 0:
+                self.player.set_time(ms)
+                return
+        except Exception:
+            return
+        if attempts > 0:
+            self.root.after(500, lambda: self._resume_position(ms, attempts - 1))
+
     def on_closing(self):
-        self.player.stop()
+        try:
+            if self._shutdown_job is not None:
+                self.root.after_cancel(self._shutdown_job)
+                self._shutdown_job = None
+            self._save_config()
+            self.player.stop()
+        except Exception:
+            pass
         self.root.destroy()
 
 
